@@ -1190,6 +1190,12 @@ pub struct Renderer {
     /// Splitscreen: the caller waits for the GPU once every player has submitted
     /// (`wait_in_flight`), so one player's work overlaps the GPU drawing another's.
     pub paced_elsewhere: bool,
+    /// Unlimited FPS on a display that only shows a frame per refresh (iOS): a frame is
+    /// handed to the swapchain at most this often, the ones between are drawn into
+    /// `skip_target` and dropped, so the game runs uncapped while the screen keeps its rate.
+    present_every: Option<std::time::Duration>,
+    last_presented: Instant,
+    skip_target: Option<wgpu::Texture>,
     /// Which steps of the first frame on this device still go to the log
     /// (see `startup_step`).
     first_frame: FirstFrame,
@@ -5332,6 +5338,9 @@ impl Renderer {
             offscreen,
             in_flight: std::collections::VecDeque::new(),
             paced_elsewhere: false,
+            present_every: None,
+            last_presented: Instant::now(),
+            skip_target: None,
             first_frame: if previous.is_none() {
                 FirstFrame::Acquire
             } else {
@@ -5910,6 +5919,14 @@ impl Renderer {
                 view_formats: &[],
             })
             .create_view(&Default::default())
+    }
+    /// Draw frames faster than the swapchain presents them: `Some(interval)` hands the swapchain
+    /// a frame once per `interval` and drops the rest, `None` presents every frame.
+    pub fn set_present_interval(&mut self, every: Option<std::time::Duration>) {
+        self.present_every = every;
+        if every.is_none() {
+            self.skip_target = None;
+        }
     }
     /// VSync on presents with Fifo, capped to the display's refresh rate in a
     /// window and in fullscreen alike; Horizon's present-mode setting applies
@@ -8641,7 +8658,22 @@ impl Renderer {
         // The present thread failed: this frame acquires as without frame generation.
         let fg = fg_frames.is_some();
         let mut fg_made = false;
-        let acquired = if fg {
+        // Unlimited FPS: between two presents the frame is drawn into a texture of its own.
+        let skip_present = !fg
+            && self.surface.is_some()
+            && self.offscreen.is_none()
+            && self
+                .present_every
+                .is_some_and(|every| self.last_presented.elapsed() < every);
+        if skip_present {
+            let stale = self.skip_target.as_ref().is_none_or(|t| {
+                t.width() != self.config.width || t.height() != self.config.height
+            });
+            if stale {
+                self.skip_target = Some(Self::offscreen_target(&self.device, &self.config));
+            }
+        }
+        let acquired = if fg || skip_present {
             None
         } else {
             self.surface.as_ref().map(|s| s.get_current_texture())
@@ -8695,7 +8727,11 @@ impl Renderer {
             (f, None) => {
                 let image = match f {
                     Some(f) => f.texture.clone(),
-                    None => self.offscreen.clone().ok_or("no offscreen target")?,
+                    None => self
+                        .offscreen
+                        .clone()
+                        .or_else(|| self.skip_target.clone().filter(|_| skip_present))
+                        .ok_or("no offscreen target")?,
                 };
                 self.readback
                     .target(
@@ -12531,6 +12567,7 @@ impl Renderer {
                 startup_step(format_args!("presenting the first frame"));
             }
             self.queue.present(surface_frame);
+            self.last_presented = Instant::now();
             if self.hdr.is_some()
                 && let Some(marker) = self.hdr_marker.take()
             {
@@ -12543,7 +12580,7 @@ impl Renderer {
         } else if let Some((real, generated)) = fg_frames {
             self.frame_gen.present(real, generated, fg_made);
         }
-        if self.surface.is_none() {
+        if self.surface.is_none() || skip_present {
             // No swapchain paces offscreen frames: keep two on the GPU at most.
             self.in_flight.push_back(submission);
             if !self.paced_elsewhere {

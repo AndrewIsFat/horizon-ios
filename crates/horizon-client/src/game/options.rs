@@ -557,6 +557,12 @@ impl Game<'_> {
             r.fullbright = s.extras.fullbright;
             r.improved_transparency = s.improved_transparency;
             r.set_present_mode(s.vsync, s.horizon.present_mode);
+            // iOS shows a frame per refresh whatever the present mode: Unlimited (260) draws
+            // uncapped and hands the screen a frame every ~6 ms (a ProMotion refresh is 8.3 ms).
+            r.set_present_interval(
+                (cfg!(target_os = "ios") && s.max_fps >= 260)
+                    .then(|| std::time::Duration::from_millis(6)),
+            );
             r.animated_textures = s.horizon.animated_textures;
             r.screenshot_quality = s.horizon.screenshot_quality;
             r.set_mipmap_levels(s.mipmap_levels.max(0) as u32);
